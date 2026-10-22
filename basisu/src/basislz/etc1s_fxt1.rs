@@ -183,7 +183,9 @@ impl Etc1sTranscoder {
 
         let fxt1_blocks_x = orig_width.div_ceil(8);
         let fxt1_blocks_y = orig_height.div_ceil(4);
-        let mut blocks = vec![Fxt1Block::default(); (fxt1_blocks_x * fxt1_blocks_y) as usize];
+        // A block count that does not fit in `u32` is rejected before allocation.
+        let n = usize::try_from(fxt1_blocks_x.checked_mul(fxt1_blocks_y)?).ok()?;
+        let mut blocks = vec![Fxt1Block::default(); n];
 
         for block_y in 0..num_blocks_y {
             for block_x in 0..num_blocks_x {
@@ -204,8 +206,10 @@ impl Etc1sTranscoder {
         // count. Each FXT1 block lands at its ceil(w/8)-pitched
         // slot, so the FXT1 data is contiguous from offset 0 and the trailing
         // slots stay zero. The length and padding are part of the expected output.
-        let total_4x4 = (num_blocks_x * num_blocks_y) as usize;
-        if out.len() != total_4x4 * 16 {
+        let total_4x4 =
+            usize::try_from(u64::from(num_blocks_x).checked_mul(u64::from(num_blocks_y))?).ok()?;
+        let out_bytes = total_4x4.checked_mul(16)?;
+        if out.len() != out_bytes {
             return None;
         }
         out.fill(0);
@@ -213,5 +217,36 @@ impl Etc1sTranscoder {
             out[b * 16..b * 16 + 16].copy_from_slice(&blk.to_bytes());
         }
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::super::etc1s::{Endpoint, Etc1sTranscoder, Selector};
+
+    fn transcoder() -> Etc1sTranscoder {
+        let mut t = Etc1sTranscoder::new();
+        t.endpoints.push(Endpoint::default());
+        t.selectors.push(Selector::default());
+        t
+    }
+
+    #[test]
+    fn fxt1_grid_overflow_is_rejected() {
+        let t = transcoder();
+        let mut out = [];
+        // ceil(u32::MAX / 8) squared does not fit in u32.
+        assert!(t
+            .transcode_slice_fxt1(&[], 0, 0, u32::MAX, u32::MAX, None, &mut out)
+            .is_none());
+    }
+
+    #[test]
+    fn empty_fxt1_grid_succeeds() {
+        let t = transcoder();
+        let mut out = [];
+        assert!(t
+            .transcode_slice_fxt1(&[], 0, 0, 0, 0, None, &mut out)
+            .is_some());
     }
 }

@@ -814,7 +814,9 @@ fn transcode_bc7_fast_8x6(
 ) -> Option<()> {
     let dst_nx = lw.div_ceil(4);
     let dst_ny = lh.div_ceil(4);
-    if out.len() != (dst_nx * dst_ny) as usize * 16 {
+    let dst_bytes =
+        crate::checked::checked_grid_len(dst_nx, dst_ny, 16).and_then(|n| n.checked_mul(16))?;
+    if out.len() != dst_bytes {
         return None;
     }
     out.fill(0);
@@ -822,8 +824,9 @@ fn transcode_bc7_fast_8x6(
     const ENDPOINT_TOL: i32 = 0;
 
     // Unpack every physical block back to its logical form once.
-    let mut logs = Vec::with_capacity((bx * by) as usize);
-    for i in 0..(bx * by) as usize {
+    let count = crate::checked::checked_grid_len(bx, by, core::mem::size_of::<LogAstcBlock>())?;
+    let mut logs = Vec::with_capacity(count);
+    for i in 0..count {
         let src: &[u8; 16] = blocks[i * 16..i * 16 + 16].try_into().ok()?;
         logs.push(unpack_block(src, 8, 6)?);
     }
@@ -1002,15 +1005,18 @@ fn transcode_bc7_fast_6x6(
 ) -> Option<()> {
     let dst_nx = lw.div_ceil(4);
     let dst_ny = lh.div_ceil(4);
-    if out.len() != (dst_nx * dst_ny) as usize * 16 {
+    let dst_bytes =
+        crate::checked::checked_grid_len(dst_nx, dst_ny, 16).and_then(|n| n.checked_mul(16))?;
+    if out.len() != dst_bytes {
         return None;
     }
     out.fill(0);
     let bc7f_flags = bc7f::flags::DEFAULT;
     const ENDPOINT_TOL: i32 = 1;
 
-    let mut logs = Vec::with_capacity((bx * by) as usize);
-    for i in 0..(bx * by) as usize {
+    let count = crate::checked::checked_grid_len(bx, by, core::mem::size_of::<LogAstcBlock>())?;
+    let mut logs = Vec::with_capacity(count);
+    for i in 0..count {
         let src: &[u8; 16] = blocks[i * 16..i * 16 + 16].try_into().ok()?;
         logs.push(unpack_block(src, 6, 6)?);
     }
@@ -1250,4 +1256,23 @@ fn transcode_bc7_fast_6x6(
         base_by += 2;
     }
     Some(())
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::transcode_bc7_fast;
+
+    #[test]
+    fn fast_bc7_block_count_overflow_is_rejected() {
+        // Both tile arms allocate `bx * by` logical blocks. The product of
+        // `u32::MAX` with itself does not fit in the byte length of that buffer.
+        assert!(
+            transcode_bc7_fast(&[], 8, 6, u32::MAX, u32::MAX, 0, 0, false, false, &mut [])
+                .is_none()
+        );
+        assert!(
+            transcode_bc7_fast(&[], 6, 6, u32::MAX, u32::MAX, 0, 0, false, false, &mut [])
+                .is_none()
+        );
+    }
 }

@@ -24,6 +24,7 @@
 extern crate alloc;
 
 mod api;
+mod checked;
 mod mathf;
 #[doc(hidden)]
 pub mod once;

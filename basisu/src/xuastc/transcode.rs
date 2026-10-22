@@ -21,6 +21,11 @@ const FLAG_FORCE_DEBLOCK: u32 = 512;
 /// Disables the fast BC7 tile arms, forcing the generic per-pixel encoder.
 pub const FLAG_DISABLE_FAST_BC7: u32 = 1024;
 
+/// Byte length of `nbx * nby` packed 16-byte blocks, or `None` on overflow.
+fn packed_block_bytes(nbx: u32, nby: u32) -> Option<usize> {
+    crate::checked::checked_grid_len(nbx, nby, 16)?.checked_mul(16)
+}
+
 /// Decompress a stream into packed physical blocks + header info, validating
 /// the container's expectations (block size and block counts).
 fn decompress_to_blocks(
@@ -47,7 +52,10 @@ fn decompress_to_blocks(
         ok_dims.set(true);
         srgb.set(info.srgb);
         has_alpha.set(info.has_alpha);
-        *blocks.borrow_mut() = vec![0u8; (nbx * nby) as usize * 16];
+        let Some(nbytes) = packed_block_bytes(nbx, nby) else {
+            return false;
+        };
+        *blocks.borrow_mut() = vec![0u8; nbytes];
         true
     };
     let mut block_cb = |cbx: u32, cby: u32, log: &crate::astc::unpack::LogAstcBlock| -> bool {
@@ -145,4 +153,15 @@ pub fn transcode_xuastc(
     transcode_ldr(
         &blocks, sbw, sbh, bx, by, lw, lh, t4, flags, srgb, has_alpha, out,
     )
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::packed_block_bytes;
+
+    #[test]
+    fn packed_block_bytes_rejects_a_wrapping_product() {
+        assert!(packed_block_bytes(u32::MAX, u32::MAX).is_none());
+        assert_eq!(packed_block_bytes(2, 2), Some(64));
+    }
 }
