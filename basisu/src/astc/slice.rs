@@ -528,9 +528,10 @@ pub fn transcode_ldr(
 
     // Whole-image path: decode the entire padded image, deblock it, then emit
     // destination 4x4 blocks with plain edge clamping.
-    let img_w = bx * sbw;
-    let img_h = by * sbh;
-    let mut temp = vec![[0u8; 4]; (img_w * img_h) as usize];
+    let img_w = u32::try_from(u64::from(bx).checked_mul(u64::from(sbw))?).ok()?;
+    let img_h = u32::try_from(u64::from(by).checked_mul(u64::from(sbh))?).ok()?;
+    let pixels = crate::checked::checked_grid_len(img_w, img_h, 4)?;
+    let mut temp = vec![[0u8; 4]; pixels];
     for src_by in 0..by {
         for src_bx in 0..bx {
             let b = ((src_bx + src_by * bx) as usize) * 16;
@@ -587,4 +588,33 @@ pub fn transcode_ldr(
         }
     }
     Some(())
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::{transcode_ldr, Target4x4, FLAG_FORCE_DEBLOCK};
+
+    #[test]
+    fn whole_image_pixel_count_overflow_is_rejected() {
+        // One source block, so the earlier block-byte check passes, but the
+        // claimed block is u32::MAX on each side. The pixel buffer's byte
+        // length does not fit.
+        let img = [0u8; 16];
+        let mut out = [0u8; 16];
+        assert!(transcode_ldr(
+            &img,
+            u32::MAX,
+            u32::MAX,
+            1,
+            1,
+            4,
+            4,
+            Target4x4::Bc7,
+            FLAG_FORCE_DEBLOCK,
+            false,
+            false,
+            &mut out,
+        )
+        .is_none());
+    }
 }
