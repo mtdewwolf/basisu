@@ -88,18 +88,53 @@ pub struct XuastcInfo {
     pub srgb: bool,
 }
 
-/// Decompress one whole zstd frame. The frame must declare its content size
-/// (unknown-size frames are rejected), which is capped at i32::MAX. Empty
-/// input decodes to empty output.
-#[cfg(feature = "zstd")]
-fn zstd_channel(comp: &[u8]) -> Option<Vec<u8>> {
-    use ruzstd::io::Read;
-    if comp.is_empty() {
-        return Some(Vec::new());
+/// Bytes of one decompressed side channel that fit a single block. The
+/// fattest channel is two planes of a 64-sample weight grid (128 bytes).
+/// 256 leaves a little slack for a short trailer without trusting the
+/// frame's declared content size.
+const CHANNEL_BYTES_PER_BLOCK: u64 = 256;
+
+/// Upper bound on one decompressed XUASTC side channel for an image of this
+/// shape. `None` when the product does not fit in `usize`.
+fn channel_limit(width: u32, height: u32, block_w: u32, block_h: u32) -> Option<usize> {
+    if block_w == 0 || block_h == 0 || width == 0 || height == 0 {
+        return None;
     }
-    // Frame header: magic, then the descriptor byte giving the
-    // Frame_Content_Size field width. When that field is absent, the size is
-    // known only if the single-segment flag implies a 1-byte size.
+    let blocks =
+        u64::from(width.div_ceil(block_w)).checked_mul(u64::from(height.div_ceil(block_h)))?;
+    let bytes = blocks.checked_mul(CHANNEL_BYTES_PER_BLOCK)?;
+    let bytes = usize::try_from(bytes).ok()?;
+    // Geometry raises the cap only up to the absolute ceiling.
+    Some(bytes.min(crate::zstd_dec::MAX_OUTPUT_BYTES))
+}
+
+/// Width, height, and block size at the front of an arith or hybrid stream.
+/// The read does not consume the buffer `decompress_arith` parses again.
+fn arith_image_dims(arith_buf: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    let mut dec = ArithDec::new(arith_buf)?;
+    if dec.get_bits(ARITH_HEADER_MARKER_BITS) != ARITH_HEADER_MARKER {
+        return None;
+    }
+    let bsi = usize::try_from(dec.get_bits(4)).ok()?;
+    if bsi >= ASTC_BLOCK_SIZES.len() {
+        return None;
+    }
+    let (block_w, block_h) = ASTC_BLOCK_SIZES[bsi];
+    let _srgb = dec.get_bit();
+    let width = dec.get_bits(16);
+    let height = dec.get_bits(16);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height, block_w, block_h))
+}
+
+/// Declared `Frame_Content_Size`, or `None` when the frame does not carry one
+/// or the header is truncated. The value is a `u64`; callers convert it with
+/// `usize::try_from` so a size that does not fit the target is rejected
+/// instead of truncated.
+#[cfg(feature = "zstd")]
+fn frame_content_size(comp: &[u8]) -> Option<u64> {
     if comp.len() < 5 || comp[..4] != [0x28, 0xB5, 0x2F, 0xFD] {
         return None;
     }
@@ -110,7 +145,8 @@ fn zstd_channel(comp: &[u8]) -> Option<Vec<u8>> {
     }
     let fcs_flag = desc >> 6;
     let single_segment = desc & 0x20 != 0;
-    let did_size = [0usize, 1, 2, 4][(desc & 3) as usize];
+    let did_flag = usize::from(desc & 3);
+    let did_size = [0usize, 1, 2, 4][did_flag];
     let fcs_size = match fcs_flag {
         0 => {
             if single_segment {
@@ -124,49 +160,51 @@ fn zstd_channel(comp: &[u8]) -> Option<Vec<u8>> {
         _ => 8,
     };
     let window_size = usize::from(!single_segment);
-    let fcs_ofs = 5 + window_size + did_size;
-    if comp.len() < fcs_ofs + fcs_size {
+    let fcs_ofs = 5usize.checked_add(window_size)?.checked_add(did_size)?;
+    let fcs_end = fcs_ofs.checked_add(fcs_size)?;
+    if comp.len() < fcs_end {
         return None;
     }
     let mut want = 0u64;
     for i in 0..fcs_size {
-        want |= (comp[fcs_ofs + i] as u64) << (8 * i);
+        want |= u64::from(comp[fcs_ofs + i]) << (8 * i);
     }
     if fcs_size == 2 {
-        want += 256;
+        want = want.checked_add(256)?;
     }
-    if want > i32::MAX as u64 {
+    Some(want)
+}
+
+/// Decompress one zstd frame, capped at `max_out` bytes.
+///
+/// `max_out` is how much output this image can hold, and it is lowered to
+/// [`crate::zstd_dec::MAX_OUTPUT_BYTES`]. The frame's declared content size
+/// is not an allocation size: a declaration above that cap, or above
+/// `i32::MAX`, is rejected before the decoder is built. The decoder window
+/// is capped separately, so a window larger than the content is accepted.
+/// A frame may still decode to fewer bytes than it declared. Output past
+/// the cap is rejected while bytes are read. Empty input decodes to empty
+/// output.
+#[cfg(feature = "zstd")]
+fn zstd_channel(comp: &[u8], max_out: usize) -> Option<Vec<u8>> {
+    if comp.is_empty() {
+        return Some(Vec::new());
+    }
+    let max_out = max_out.min(crate::zstd_dec::MAX_OUTPUT_BYTES);
+    let declared = frame_content_size(comp)?;
+    if declared > i32::MAX as u64 {
         return None;
     }
-    let want = want as usize;
-
-    // The frame may legitimately decode to fewer bytes than its declared
-    // content size, so the output is truncated to what actually decoded;
-    // decoding more than the declared size is an error.
-    let mut dec = ruzstd::decoding::StreamingDecoder::new(comp).ok()?;
-    let mut out = vec![0u8; want];
-    let mut total = 0usize;
-    loop {
-        if total == want {
-            let mut extra = [0u8; 1];
-            if dec.read(&mut extra).ok()? != 0 {
-                return None; // dstSize_tooSmall
-            }
-            break;
-        }
-        match dec.read(&mut out[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(_) => return None,
-        }
+    let declared = usize::try_from(declared).ok()?;
+    if declared > max_out {
+        return None;
     }
-    out.truncate(total);
-    Some(out)
+    crate::zstd_dec::decode_limited(comp, declared)
 }
 
 /// Stub used when the `zstd` feature is off: no channel can be decoded.
 #[cfg(not(feature = "zstd"))]
-fn zstd_channel(_comp: &[u8]) -> Option<Vec<u8>> {
+fn zstd_channel(_comp: &[u8], _max_out: usize) -> Option<Vec<u8>> {
     None
 }
 
@@ -390,46 +428,13 @@ fn decompress_full_zstd(
     let raw_slice = take!(raw_bits_len);
     let mut raw_bits = BitwiseDecoder::new(raw_slice);
 
-    // The zstd side channels, in payload order; sign bits are stored raw.
-    let uncomp_mode = zstd_channel(take!(mode_bytes_len))?;
-    let uncomp_solid = zstd_channel(take!(solid_dpcm_len))?;
-    let uncomp_ep_reuse = zstd_channel(take!(ep_reuse_len))?;
-    let uncomp_use_bc = zstd_channel(take!(use_bc_len))?;
-    let mut uncomp_ep_dpcm: [Vec<u8>; 6] = Default::default();
-    for (i, l) in ep_dpcm_len.iter().enumerate() {
-        uncomp_ep_dpcm[i] = zstd_channel(take!(*l))?;
-    }
-    let uncomp_mean0 = zstd_channel(take!(mean0_len))?;
-    let uncomp_mean1 = zstd_channel(take!(mean1_len))?;
-    let uncomp_run = zstd_channel(take!(run_len))?;
-    let uncomp_coeff = zstd_channel(take!(coeff_len))?;
-    let sign_slice = take!(sign_len);
-    let uncomp_w2 = zstd_channel(take!(w2_len))?;
-    let uncomp_w3 = zstd_channel(take!(w3_len))?;
-    let uncomp_w4 = zstd_channel(take!(w4_len))?;
-    let uncomp_w8 = zstd_channel(take!(w8_len))?;
-
-    let mut mode_dec = SimplifiedDecoder::new(&uncomp_mode);
-    let mut solid_dec = SimplifiedDecoder::new(&uncomp_solid);
-    let mut ep_reuse_dec = SimplifiedDecoder::new(&uncomp_ep_reuse);
-    let mut use_bc_dec = SimplifiedDecoder::new(&uncomp_use_bc);
-    let mut ep_dpcm_dec: [SimplifiedDecoder; 6] =
-        core::array::from_fn(|i| SimplifiedDecoder::new(&uncomp_ep_dpcm[i]));
-    let mut mean0_dec = SimplifiedDecoder::new(&uncomp_mean0);
-    let mut mean1_dec = SimplifiedDecoder::new(&uncomp_mean1);
-    let mut run_dec = SimplifiedDecoder::new(&uncomp_run);
-    let mut coeff_dec = SimplifiedDecoder::new(&uncomp_coeff);
-    let mut sign_dec = SimplifiedDecoder::new(sign_slice);
-    let mut w2_dec = SimplifiedDecoder::new(&uncomp_w2);
-    let mut w3_dec = SimplifiedDecoder::new(&uncomp_w3);
-    let mut w4_dec = SimplifiedDecoder::new(&uncomp_w4);
-    let mut w8_dec = SimplifiedDecoder::new(&uncomp_w8);
-
-    // Header fields from the raw bit stream.
+    // Header before any channel inflate, so each frame is capped by the image
+    // instead of by its declared content size. The init callback can still
+    // abort before those allocations.
     if raw_bits.get_bits(FULL_ZSTD_HEADER_MARKER_BITS) != FULL_ZSTD_HEADER_MARKER {
         return None;
     }
-    let bsi = raw_bits.get_bits(4) as usize;
+    let bsi = usize::try_from(raw_bits.get_bits(4)).ok()?;
     if bsi >= ASTC_BLOCK_SIZES.len() {
         return None;
     }
@@ -464,6 +469,42 @@ fn decompress_full_zstd(
     if !init_cb(&info) {
         return None;
     }
+    let limit = channel_limit(width, height, block_width, block_height)?;
+
+    // The zstd side channels, in payload order; sign bits are stored raw.
+    let uncomp_mode = zstd_channel(take!(mode_bytes_len), limit)?;
+    let uncomp_solid = zstd_channel(take!(solid_dpcm_len), limit)?;
+    let uncomp_ep_reuse = zstd_channel(take!(ep_reuse_len), limit)?;
+    let uncomp_use_bc = zstd_channel(take!(use_bc_len), limit)?;
+    let mut uncomp_ep_dpcm: [Vec<u8>; 6] = Default::default();
+    for (i, l) in ep_dpcm_len.iter().enumerate() {
+        uncomp_ep_dpcm[i] = zstd_channel(take!(*l), limit)?;
+    }
+    let uncomp_mean0 = zstd_channel(take!(mean0_len), limit)?;
+    let uncomp_mean1 = zstd_channel(take!(mean1_len), limit)?;
+    let uncomp_run = zstd_channel(take!(run_len), limit)?;
+    let uncomp_coeff = zstd_channel(take!(coeff_len), limit)?;
+    let sign_slice = take!(sign_len);
+    let uncomp_w2 = zstd_channel(take!(w2_len), limit)?;
+    let uncomp_w3 = zstd_channel(take!(w3_len), limit)?;
+    let uncomp_w4 = zstd_channel(take!(w4_len), limit)?;
+    let uncomp_w8 = zstd_channel(take!(w8_len), limit)?;
+
+    let mut mode_dec = SimplifiedDecoder::new(&uncomp_mode);
+    let mut solid_dec = SimplifiedDecoder::new(&uncomp_solid);
+    let mut ep_reuse_dec = SimplifiedDecoder::new(&uncomp_ep_reuse);
+    let mut use_bc_dec = SimplifiedDecoder::new(&uncomp_use_bc);
+    let mut ep_dpcm_dec: [SimplifiedDecoder; 6] =
+        core::array::from_fn(|i| SimplifiedDecoder::new(&uncomp_ep_dpcm[i]));
+    let mut mean0_dec = SimplifiedDecoder::new(&uncomp_mean0);
+    let mut mean1_dec = SimplifiedDecoder::new(&uncomp_mean1);
+    let mut run_dec = SimplifiedDecoder::new(&uncomp_run);
+    let mut coeff_dec = SimplifiedDecoder::new(&uncomp_coeff);
+    let mut sign_dec = SimplifiedDecoder::new(sign_slice);
+    let mut w2_dec = SimplifiedDecoder::new(&uncomp_w2);
+    let mut w3_dec = SimplifiedDecoder::new(&uncomp_w3);
+    let mut w4_dec = SimplifiedDecoder::new(&uncomp_w4);
+    let mut w8_dec = SimplifiedDecoder::new(&uncomp_w8);
 
     let num_blocks_x = width.div_ceil(block_width);
     let num_blocks_y = height.div_ceil(block_height);
@@ -1480,15 +1521,17 @@ pub fn decompress_image(
                 }};
             }
             let arith_buf = take!(arith_len);
-            let mean0 = zstd_channel(take!(mean0_len))?;
-            let mean1 = zstd_channel(take!(mean1_len))?;
-            let run = zstd_channel(take!(run_len))?;
-            let coeff = zstd_channel(take!(coeff_len))?;
+            let (width, height, block_w, block_h) = arith_image_dims(arith_buf)?;
+            let limit = channel_limit(width, height, block_w, block_h)?;
+            let mean0 = zstd_channel(take!(mean0_len), limit)?;
+            let mean1 = zstd_channel(take!(mean1_len), limit)?;
+            let run = zstd_channel(take!(run_len), limit)?;
+            let coeff = zstd_channel(take!(coeff_len), limit)?;
             let sign_slice = take!(sign_len);
-            let w2 = zstd_channel(take!(w2_len))?;
-            let w3 = zstd_channel(take!(w3_len))?;
-            let w4 = zstd_channel(take!(w4_len))?;
-            let w8 = zstd_channel(take!(w8_len))?;
+            let w2 = zstd_channel(take!(w2_len), limit)?;
+            let w3 = zstd_channel(take!(w3_len), limit)?;
+            let w4 = zstd_channel(take!(w4_len), limit)?;
+            let w8 = zstd_channel(take!(w8_len), limit)?;
             let side = SideChannels {
                 mean0: SimplifiedDecoder::new(&mean0),
                 mean1: SimplifiedDecoder::new(&mean1),
@@ -1503,5 +1546,99 @@ pub fn decompress_image(
             decompress_arith(arith_buf, Some(side), init_cb, block_cb)
         }
         _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "zstd"))]
+mod zstd_channel_tests {
+    use super::zstd_channel;
+
+    /// Single-segment frame: 8-byte content size, one raw block, no checksum.
+    fn raw_frame(content_size: u64, payload: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0xE0];
+        frame.extend_from_slice(&content_size.to_le_bytes());
+        push_raw_block(&mut frame, payload);
+        frame
+    }
+
+    /// Frame with an explicit 1 KiB window and a 4-byte content size.
+    ///
+    /// Descriptor `0x80` is a 4-byte content size and no single-segment flag,
+    /// so the window byte is present. `0x00` is exponent 0, mantissa 0:
+    /// window = 1 << 10 = 1024. The window is therefore larger than a short
+    /// payload, which is legal and must not be rejected.
+    fn windowed_raw_frame(content_size: u32, payload: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x00];
+        frame.extend_from_slice(&content_size.to_le_bytes());
+        push_raw_block(&mut frame, payload);
+        frame
+    }
+
+    fn push_raw_block(frame: &mut alloc::vec::Vec<u8>, payload: &[u8]) {
+        let len = u32::try_from(payload.len()).expect("payload fits a zstd block");
+        let header = 1u32 | (len << 3);
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn frame_within_cap_decodes_to_its_payload() {
+        let payload = b"hello-zstd-frame!!";
+        let frame = raw_frame(u64::try_from(payload.len()).unwrap(), payload);
+        let out = zstd_channel(&frame, 256).expect("in-cap frame");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn declared_content_size_above_cap_is_rejected() {
+        // 8 MiB is enough to be a bomb if it were allocated, and it stays
+        // under the decoder's default window so the rejection is ours.
+        let frame = raw_frame(8 * 1024 * 1024, b"tiny");
+        assert!(zstd_channel(&frame, 64).is_none());
+    }
+
+    #[test]
+    fn decoded_payload_above_cap_is_rejected() {
+        let payload = vec![0xABu8; 64];
+        let frame = raw_frame(u64::try_from(payload.len()).unwrap(), &payload);
+        assert!(zstd_channel(&frame, 16).is_none());
+    }
+
+    #[test]
+    fn content_size_past_i32_max_is_rejected() {
+        let frame = raw_frame((i32::MAX as u64) + 1, b"tiny");
+        assert!(zstd_channel(&frame, 1024).is_none());
+    }
+
+    #[test]
+    fn one_kib_window_with_short_content_decodes() {
+        // 18 bytes of content, window descriptor 1 KiB, caller cap 4096.
+        // The window is larger than the content and must still decode.
+        let payload = b"0123456789abcdefgh";
+        assert_eq!(payload.len(), 18);
+        let frame = windowed_raw_frame(18, payload);
+        let out = zstd_channel(&frame, 4096).expect("1 KiB window is inside the window cap");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn declared_size_smaller_than_payload_hits_output_cap() {
+        // The declaration (16) is under the caller cap, so the up-front
+        // declared-size check passes. The raw block is 64 bytes, and the
+        // read loop rejects it once the output cap (the declared size) is
+        // passed. A higher cap accepts the same frame, so the rejection is
+        // the output cap and not a malformed frame.
+        let payload = vec![0xCDu8; 64];
+        let frame = windowed_raw_frame(16, &payload);
+        assert!(zstd_channel(&frame, 4096).is_none());
+        assert!(crate::zstd_dec::decode_limited(&frame, 32).is_none());
+        let out = crate::zstd_dec::decode_limited(&frame, 4096).expect("payload under the cap");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn channel_limit_respects_absolute_ceiling() {
+        let limit = super::channel_limit(1_000_000, 1_000_000, 4, 4).expect("product fits usize");
+        assert_eq!(limit, crate::zstd_dec::MAX_OUTPUT_BYTES);
     }
 }

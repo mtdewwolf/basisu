@@ -28,6 +28,7 @@ mod mathf;
 #[doc(hidden)]
 pub mod once;
 mod support;
+mod zstd_dec;
 pub use api::{
     AstcBlock, DecodeFlags, Error, GlobalCodebook, ImageLevelInfo, SourceFormat, Supercompression,
     TargetFormat, Transcoder, VideoState,
