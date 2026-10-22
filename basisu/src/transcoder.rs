@@ -50,21 +50,17 @@ pub struct Ktx2Transcoder<'a> {
     is_video: bool,
 }
 
-/// Inflate a Zstandard-supercompressed KTX2 level to exactly `want` bytes
-/// (the level's `uncompressed_byte_length`). `None` if the stream is malformed
-/// or does not produce exactly `want` bytes; a size mismatch means a corrupt
-/// level. Decoding is pure Rust (`ruzstd`).
+/// Inflate a Zstandard-supercompressed KTX2 level to exactly `exact` bytes.
+///
+/// `exact` is the size derived from the level's image dimensions, not the
+/// container's declared uncompressed length. The decoder window and the
+/// output buffer are both capped there: the buffer grows as bytes arrive,
+/// and a frame that would pass that cap (or that stops short of it) is
+/// `None`. Decoding is pure Rust (`ruzstd`).
 #[cfg(feature = "zstd")]
-fn zstd_inflate(comp: &[u8], want: usize) -> Option<Vec<u8>> {
-    use ruzstd::io::Read;
-    let mut dec = ruzstd::decoding::StreamingDecoder::new(comp).ok()?;
-    let mut out = vec![0u8; want];
-    // Require an exact fill: read_exact errors if the stream yields fewer bytes.
-    dec.read_exact(&mut out).ok()?;
-    // Reject trailing data beyond `want`: a single extra byte means a
-    // malformed or oversized stream.
-    let mut extra = [0u8; 1];
-    if dec.read(&mut extra).ok()? != 0 {
+fn zstd_inflate(comp: &[u8], exact: usize) -> Option<Vec<u8>> {
+    let out = crate::zstd_dec::decode_limited(comp, exact)?;
+    if out.len() != exact {
         return None;
     }
     Some(out)
@@ -74,6 +70,17 @@ fn zstd_inflate(comp: &[u8], want: usize) -> Option<Vec<u8>> {
 #[cfg(not(feature = "zstd"))]
 fn zstd_inflate(_comp: &[u8], _want: usize) -> Option<Vec<u8>> {
     None
+}
+
+/// Uncompressed byte length of one raw-block level: every layer and face is
+/// `blocks_x * blocks_y` blocks, and every block is 16 bytes. `None` when the
+/// product does not fit in `usize` (a `u64` length cast with `as usize`
+/// would truncate on wasm32).
+fn raw_level_bytes(layers: u32, faces: u32, blocks_x: u32, blocks_y: u32) -> Option<usize> {
+    let images = u64::from(layers.max(1)).checked_mul(u64::from(faces.max(1)))?;
+    let blocks = u64::from(blocks_x).checked_mul(u64::from(blocks_y))?;
+    let bytes = blocks.checked_mul(16)?.checked_mul(images)?;
+    usize::try_from(bytes).ok()
 }
 
 /// Read a little-endian u16 at byte offset `o`. The KTX2 supercompression
@@ -398,19 +405,25 @@ impl<'a> Ktx2Transcoder<'a> {
         lh: u32,
         out: &mut [u8],
     ) -> Option<()> {
-        let l = &self.header.levels[level as usize];
-        let comp = self
-            .data
-            .get(l.byte_offset as usize..(l.byte_offset + l.byte_length) as usize)?;
-        // ss=2 (Zstandard): inflate the whole level to its uncompressed length
-        // before indexing the per-image data. ss=1 (BasisLZ) never reaches the
-        // raw-block path.
+        let l = self.header.levels.get(level as usize)?;
+        let start = usize::try_from(l.byte_offset).ok()?;
+        let comp_len = usize::try_from(l.byte_length).ok()?;
+        let end = start.checked_add(comp_len)?;
+        let comp = self.data.get(start..end)?;
+        // ss=2 (Zstandard): inflate the whole level to the size implied by
+        // its dimensions before indexing the per-image data. The declared
+        // uncompressed length is only accepted when it matches that size.
+        // ss=1 (BasisLZ) never reaches the raw-block path.
         let level_owned;
         let level_data: &[u8] = match self.header.supercompression {
             0 => comp,
             2 => {
-                let want = l.uncompressed_byte_length as usize;
-                level_owned = zstd_inflate(comp, want)?;
+                let exact =
+                    raw_level_bytes(self.header.layer_count, self.header.face_count, bx, by)?;
+                if l.uncompressed_byte_length != u64::try_from(exact).ok()? {
+                    return None;
+                }
+                level_owned = zstd_inflate(comp, exact)?;
                 &level_owned
             }
             _ => return None, // unknown supercompression scheme
@@ -424,11 +437,16 @@ impl<'a> Ktx2Transcoder<'a> {
         {
             return None;
         }
-        let n = (bx * by) as usize;
-        let total_2d = n * 16;
-        let face_count = self.header.face_count.max(1) as usize;
-        let img_ofs = (layer as usize * face_count + face as usize) * total_2d;
-        let img = level_data.get(img_ofs..img_ofs + total_2d)?;
+        let blocks = u64::from(bx).checked_mul(u64::from(by))?;
+        let total_2d = usize::try_from(blocks.checked_mul(16)?).ok()?;
+        let face_count = usize::try_from(self.header.face_count.max(1)).ok()?;
+        let img_index = usize::try_from(layer)
+            .ok()?
+            .checked_mul(face_count)?
+            .checked_add(usize::try_from(face).ok()?)?;
+        let img_ofs = img_index.checked_mul(total_2d)?;
+        let img_end = img_ofs.checked_add(total_2d)?;
+        let img = level_data.get(img_ofs..img_end)?;
 
         match self.header.format {
             BasisFormat::UastcHdr4x4 => {

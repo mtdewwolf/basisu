@@ -309,3 +309,34 @@ fn byte_flipping_a_real_file_never_panics() {
         data[i] = orig;
     }
 }
+
+/// Zstandard level whose `uncompressedByteLength` is larger than the image.
+/// A `u64` that truncates to the real length on wasm32 (`as usize`) must
+/// still be rejected, and so must a length that merely exceeds the geometry.
+#[test]
+fn zstd_level_rejects_oversized_uncompressed_length() {
+    const ASTC_HDR_ZSTD: &[u8] = include_bytes!("../../corpus/smoke/astc_hdr_6x6_zstd.ktx2");
+    // Level 0's uncompressed length is the third u64 of the level index
+    // entry at file offset 80.
+    const UNCOMP_OFF: usize = 96;
+
+    let t = Transcoder::new(ASTC_HDR_ZSTD).unwrap();
+    let target = TargetFormat::Rgb9e5;
+    assert!(t.supports(target));
+    assert!(t.transcode(0, target, DecodeFlags::NONE).is_ok());
+
+    let declared = u64::from_le_bytes(
+        ASTC_HDR_ZSTD[UNCOMP_OFF..UNCOMP_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    for oversized in [declared + 1, declared + (1 << 32), u64::MAX] {
+        let mut blown = ASTC_HDR_ZSTD.to_vec();
+        blown[UNCOMP_OFF..UNCOMP_OFF + 8].copy_from_slice(&oversized.to_le_bytes());
+        let t = Transcoder::new(&blown).expect("header still parses");
+        assert!(
+            t.transcode(0, target, DecodeFlags::NONE).is_err(),
+            "uncompressed length {oversized:#x} must not be inflated"
+        );
+    }
+}
