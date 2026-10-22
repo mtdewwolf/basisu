@@ -53,12 +53,17 @@ pub struct Ktx2Transcoder<'a> {
 /// Inflate a Zstandard-supercompressed KTX2 level to exactly `exact` bytes.
 ///
 /// `exact` is the size derived from the level's image dimensions, not the
-/// container's declared uncompressed length. The decoder window and the
-/// output buffer are both capped there: the buffer grows as bytes arrive,
-/// and a frame that would pass that cap (or that stops short of it) is
-/// `None`. Decoding is pure Rust (`ruzstd`).
+/// container's declared uncompressed length. The output buffer grows as
+/// bytes arrive and is capped at `exact`. The decoder window is capped
+/// separately, so a frame may advertise a window larger than its content.
+/// A frame that would pass the output cap, stop short of `exact`, or whose
+/// `exact` size exceeds [`crate::zstd_dec::MAX_OUTPUT_BYTES`] is `None`.
+/// Decoding is pure Rust (`ruzstd`).
 #[cfg(feature = "zstd")]
 fn zstd_inflate(comp: &[u8], exact: usize) -> Option<Vec<u8>> {
+    if exact > crate::zstd_dec::MAX_OUTPUT_BYTES {
+        return None;
+    }
     let out = crate::zstd_dec::decode_limited(comp, exact)?;
     if out.len() != exact {
         return None;
@@ -80,7 +85,11 @@ fn raw_level_bytes(layers: u32, faces: u32, blocks_x: u32, blocks_y: u32) -> Opt
     let images = u64::from(layers.max(1)).checked_mul(u64::from(faces.max(1)))?;
     let blocks = u64::from(blocks_x).checked_mul(u64::from(blocks_y))?;
     let bytes = blocks.checked_mul(16)?.checked_mul(images)?;
-    usize::try_from(bytes).ok()
+    let bytes = usize::try_from(bytes).ok()?;
+    if bytes > crate::zstd_dec::MAX_OUTPUT_BYTES {
+        return None;
+    }
+    Some(bytes)
 }
 
 /// Read a little-endian u16 at byte offset `o`. The KTX2 supercompression
@@ -480,5 +489,21 @@ impl<'a> Ktx2Transcoder<'a> {
                 out,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_level_bytes_tests {
+    use super::raw_level_bytes;
+
+    #[test]
+    fn exact_size_above_the_ceiling_is_rejected() {
+        // 4096² blocks is exactly 256 MiB. One more block-row crosses it.
+        assert_eq!(
+            raw_level_bytes(1, 1, 4096, 4096),
+            Some(crate::zstd_dec::MAX_OUTPUT_BYTES)
+        );
+        assert!(raw_level_bytes(1, 1, 4097, 4096).is_none());
+        assert_eq!(raw_level_bytes(1, 1, 2, 2), Some(64));
     }
 }

@@ -103,7 +103,9 @@ fn channel_limit(width: u32, height: u32, block_w: u32, block_h: u32) -> Option<
     let blocks =
         u64::from(width.div_ceil(block_w)).checked_mul(u64::from(height.div_ceil(block_h)))?;
     let bytes = blocks.checked_mul(CHANNEL_BYTES_PER_BLOCK)?;
-    usize::try_from(bytes).ok()
+    let bytes = usize::try_from(bytes).ok()?;
+    // Geometry raises the cap only up to the absolute ceiling.
+    Some(bytes.min(crate::zstd_dec::MAX_OUTPUT_BYTES))
 }
 
 /// Width, height, and block size at the front of an arith or hybrid stream.
@@ -143,7 +145,7 @@ fn frame_content_size(comp: &[u8]) -> Option<u64> {
     }
     let fcs_flag = desc >> 6;
     let single_segment = desc & 0x20 != 0;
-    let did_flag = usize::try_from(desc & 3).ok()?;
+    let did_flag = usize::from(desc & 3);
     let did_size = [0usize, 1, 2, 4][did_flag];
     let fcs_size = match fcs_flag {
         0 => {
@@ -175,16 +177,20 @@ fn frame_content_size(comp: &[u8]) -> Option<u64> {
 
 /// Decompress one zstd frame, capped at `max_out` bytes.
 ///
-/// `max_out` is how much output this image can hold. The frame's declared
-/// content size is not an allocation size: a declaration above `max_out`, or
-/// above `i32::MAX`, is rejected before the decoder builds its window. A
-/// frame may still decode to fewer bytes than it declared. Empty input
-/// decodes to empty output.
+/// `max_out` is how much output this image can hold, and it is lowered to
+/// [`crate::zstd_dec::MAX_OUTPUT_BYTES`]. The frame's declared content size
+/// is not an allocation size: a declaration above that cap, or above
+/// `i32::MAX`, is rejected before the decoder is built. The decoder window
+/// is capped separately, so a window larger than the content is accepted.
+/// A frame may still decode to fewer bytes than it declared. Output past
+/// the cap is rejected while bytes are read. Empty input decodes to empty
+/// output.
 #[cfg(feature = "zstd")]
 fn zstd_channel(comp: &[u8], max_out: usize) -> Option<Vec<u8>> {
     if comp.is_empty() {
         return Some(Vec::new());
     }
+    let max_out = max_out.min(crate::zstd_dec::MAX_OUTPUT_BYTES);
     let declared = frame_content_size(comp)?;
     if declared > i32::MAX as u64 {
         return None;
@@ -1551,11 +1557,28 @@ mod zstd_channel_tests {
     fn raw_frame(content_size: u64, payload: &[u8]) -> alloc::vec::Vec<u8> {
         let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0xE0];
         frame.extend_from_slice(&content_size.to_le_bytes());
+        push_raw_block(&mut frame, payload);
+        frame
+    }
+
+    /// Frame with an explicit 1 KiB window and a 4-byte content size.
+    ///
+    /// Descriptor `0x80` is a 4-byte content size and no single-segment flag,
+    /// so the window byte is present. `0x00` is exponent 0, mantissa 0:
+    /// window = 1 << 10 = 1024. The window is therefore larger than a short
+    /// payload, which is legal and must not be rejected.
+    fn windowed_raw_frame(content_size: u32, payload: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x00];
+        frame.extend_from_slice(&content_size.to_le_bytes());
+        push_raw_block(&mut frame, payload);
+        frame
+    }
+
+    fn push_raw_block(frame: &mut alloc::vec::Vec<u8>, payload: &[u8]) {
         let len = u32::try_from(payload.len()).expect("payload fits a zstd block");
         let header = 1u32 | (len << 3);
         frame.extend_from_slice(&header.to_le_bytes()[..3]);
         frame.extend_from_slice(payload);
-        frame
     }
 
     #[test]
@@ -1585,5 +1608,37 @@ mod zstd_channel_tests {
     fn content_size_past_i32_max_is_rejected() {
         let frame = raw_frame((i32::MAX as u64) + 1, b"tiny");
         assert!(zstd_channel(&frame, 1024).is_none());
+    }
+
+    #[test]
+    fn one_kib_window_with_short_content_decodes() {
+        // 18 bytes of content, window descriptor 1 KiB, caller cap 4096.
+        // The window is larger than the content and must still decode.
+        let payload = b"0123456789abcdefgh";
+        assert_eq!(payload.len(), 18);
+        let frame = windowed_raw_frame(18, payload);
+        let out = zstd_channel(&frame, 4096).expect("1 KiB window is inside the window cap");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn declared_size_smaller_than_payload_hits_output_cap() {
+        // The declaration (16) is under the caller cap, so the up-front
+        // declared-size check passes. The raw block is 64 bytes, and the
+        // read loop rejects it once the output cap (the declared size) is
+        // passed. A higher cap accepts the same frame, so the rejection is
+        // the output cap and not a malformed frame.
+        let payload = vec![0xCDu8; 64];
+        let frame = windowed_raw_frame(16, &payload);
+        assert!(zstd_channel(&frame, 4096).is_none());
+        assert!(crate::zstd_dec::decode_limited(&frame, 32).is_none());
+        let out = crate::zstd_dec::decode_limited(&frame, 4096).expect("payload under the cap");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn channel_limit_respects_absolute_ceiling() {
+        let limit = super::channel_limit(1_000_000, 1_000_000, 4, 4).expect("product fits usize");
+        assert_eq!(limit, crate::zstd_dec::MAX_OUTPUT_BYTES);
     }
 }
